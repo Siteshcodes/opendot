@@ -809,6 +809,38 @@ def test_write_file_neutralizes_in_workspace_symlink_file(tmp_path):
     assert (wd / "notes.txt").read_text() == "NEW"
 
 
+def test_write_file_symlink_equal_content_is_not_a_noop(tmp_path):
+    """Content matching the link target must not short-circuit as a no-op and
+    leave the escaping symlink in place. (#164)"""
+    tb, wd, _ = _tb(tmp_path)
+    secret = tmp_path / "outside_secret"
+    secret.write_text("SAME", encoding="utf-8")
+    (wd / "notes.txt").symlink_to(secret)
+
+    out = tb.call("write_file", {"path": "notes.txt", "content": "SAME"})
+
+    assert not out.startswith("no change")
+    assert not (wd / "notes.txt").is_symlink()
+    assert (wd / "notes.txt").read_text() == "SAME"
+
+
+def test_write_file_symlink_does_not_leak_target_or_claim_undo(tmp_path):
+    """The diff must not show the link target's content, and the ledger must not
+    claim undo restores the link (snapshots don't capture symlinks). (#164)"""
+    tb, wd, rev = _tb(tmp_path)
+    secret = tmp_path / "outside_secret"
+    secret.write_text("TOPSECRET\n", encoding="utf-8")
+    (wd / "notes.txt").symlink_to(secret)
+
+    out = tb.call("write_file", {"path": "notes.txt", "content": "NEW\n"})
+
+    assert "TOPSECRET" not in out
+    assert out.startswith("created")
+    entry = rev.history()[-1]
+    assert not entry.reversible
+    assert "symlink" in entry.note
+
+
 def test_write_file_normal_in_workspace_write_unaffected(tmp_path):
     tb, wd, _ = _tb(tmp_path)
     out = tb.call("write_file", {"path": "src/new.py", "content": "q = 1\n"})

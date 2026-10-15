@@ -336,6 +336,29 @@ class Toolbox:
         except ValueError:
             return True
 
+    def _symlinked_component(self, p: Path) -> Path | None:
+        """First component of the in-workspace path ``p`` (walking down from the
+        working directory, ``p`` itself included) that is a symlink, else None.
+
+        ``_safe_write_within_workspace`` replaces such a component instead of
+        following it, so the caller must not read through it (that would surface
+        the link target's content) and must not claim the link comes back on undo:
+        snapshots don't capture symlinks."""
+        norm = Path(os.path.abspath(str(p)))
+        wd = Path(os.path.abspath(str(self.workdir)))
+        try:
+            parts = norm.relative_to(wd).parts
+        except ValueError:
+            return None
+        cur = wd
+        for part in parts:
+            cur = cur / part
+            if cur.is_symlink():
+                return cur
+            if not cur.exists():
+                return None
+        return None
+
     def _safe_write_within_workspace(self, p: Path, content: str) -> None:
         """Write ``content`` to ``p`` (inside the workspace) with the strongest
         open-time containment the OS offers, so a symlinked / swapped path
@@ -609,9 +632,16 @@ class Toolbox:
 
         def write_file(path: str, content: str) -> str:
             p = self._resolve(path)
+            # A write outside the working dir isn't covered by the snapshot, so it
+            # can't be undone. Confirm first and record it honestly as irreversible,
+            # exactly like an escaping shell command. Never claim a lying undo.
+            outside = self._is_lexically_outside_workspace(p)
+            # In-workspace, a symlinked component gets replaced rather than followed
+            # (containment wins), so its target is never what we're writing to.
+            link = None if outside else self._symlinked_component(p)
             old = ""
             read_ok = False  # did we actually read the existing file's content?
-            if p.exists():
+            if link is None and p.exists():
                 try:
                     old = p.read_text(encoding="utf-8", errors="replace")
                     read_ok = True
@@ -623,20 +653,22 @@ class Toolbox:
             if read_ok and old == content:
                 rel = self._rel(p)
                 return f"no change to {rel} (content identical)\n"
-            # A write outside the working dir isn't covered by the snapshot, so it
-            # can't be undone. Confirm first and record it honestly as irreversible,
-            # exactly like an escaping shell command. Never claim a lying undo.
-            outside = self._is_lexically_outside_workspace(p)
             if outside and not self._confirm(
                 f"This writes outside the workspace and can't be undone:\n  {p}\nWrite it?"
             ):
                 return "skipped: user declined a write outside the workspace"
             if self.rev is not None:
+                if outside:
+                    note = "outside the workspace — not undoable"
+                elif link is not None:
+                    note = f"replaces symlink {self._rel_no_resolve(link)} — undo won't restore the link"
+                else:
+                    note = ""
                 self.rev.before_action(
                     "write",
                     str(p),
-                    reversible=not outside,
-                    note="outside the workspace — not undoable" if outside else "",
+                    reversible=not outside and link is None,
+                    note=note,
                 )
             try:
                 if outside:
